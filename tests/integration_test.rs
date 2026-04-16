@@ -1,179 +1,201 @@
-use rilua::{Lua, LuaApi, LuaApiMut};
-use rilua_derive::{lua_methods, LuaUserData};
+use rilua::{Lua, LuaApiMut};
+use rilua_derive::{LuaUserData, lua_callable, lua_function, lua_register};
 
 #[derive(LuaUserData)]
 struct Counter {
     count: i32,
 }
 
-#[lua_methods]
+#[lua_register]
 impl Counter {
-    #[lua(constructor)]
+    #[lua_callable]
     fn new(initial: i32) -> Self {
         Self { count: initial }
     }
 
-    #[lua]
+    #[lua_callable("zero")]
+    fn default() -> Self {
+        Self { count: 0 }
+    }
+
+    #[lua_callable]
+    fn modify(&mut self, new_value: i32) {
+        self.count = new_value;
+    }
+
+    #[lua_callable("value")]
     fn get(&self) -> i32 {
         self.count
     }
 
-    #[lua]
-    fn increment(&mut self) {
+    #[lua_function("step")]
+    fn inc(&mut self, _state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
         self.count += 1;
+        Ok(0)
     }
 
-    #[lua]
-    fn add(&mut self, amount: i32) {
-        self.count += amount;
+    #[lua_function]
+    fn dec(&mut self, _state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
+        self.count -= 1;
+        Ok(0)
     }
 }
 
 #[test]
-fn test_userdata_immutable() {
-    let mut lua = Lua::new().unwrap();
-    Counter::register(lua.state_mut()).unwrap();
-
-    let counter = Counter { count: 42 };
-    let ud = lua.create_typed_userdata(counter, "Counter").unwrap();
-    lua.set_global("counter", ud).unwrap();
-
-    lua.exec("result = counter:get()").unwrap();
-
-    let result: f64 = lua.global("result").unwrap();
-    assert_eq!(result, 42.0);
-}
-
-#[test]
-fn test_userdata_mutable() {
-    let mut lua = Lua::new().unwrap();
-    Counter::register(lua.state_mut()).unwrap();
-
-    let counter = Counter { count: 0 };
-    let ud = lua.create_typed_userdata(counter, "Counter").unwrap();
-    lua.set_global("counter", ud).unwrap();
-
-    lua.exec("counter:increment()").unwrap();
-    lua.exec("counter:increment()").unwrap();
-    lua.exec("result = counter:get()").unwrap();
-
-    let result: f64 = lua.global("result").unwrap();
-    assert_eq!(result, 2.0);
-}
-
-#[test]
-fn test_userdata_with_args() {
-    let mut lua = Lua::new().unwrap();
-    Counter::register(lua.state_mut()).unwrap();
-
-    let counter = Counter { count: 10 };
-    let ud = lua.create_typed_userdata(counter, "Counter").unwrap();
-    lua.set_global("counter", ud).unwrap();
-
-    lua.exec("counter:add(5)").unwrap();
-    lua.exec("result = counter:get()").unwrap();
-
-    let result: f64 = lua.global("result").unwrap();
-    assert_eq!(result, 15.0);
-}
-
-#[test]
-fn test_constructor() {
+fn test_counter_new() {
     let mut lua = Lua::new().unwrap();
     Counter::register(lua.state_mut()).unwrap();
 
     lua.exec(
         r#"
-        local c = Counter(100)
-        result = c:get()
+        local c = Counter.new(5)
+        assert(c:value() == 5, "Counter should start at 5")
     "#,
     )
     .unwrap();
-
-    let result: f64 = lua.global("result").unwrap();
-    assert_eq!(result, 100.0);
 }
 
-// Approach 1: Bidirectional access using AnyUserData.borrow()
 #[test]
-fn test_approach1_bidirectional_access() {
+fn test_counter_zero() {
     let mut lua = Lua::new().unwrap();
     Counter::register(lua.state_mut()).unwrap();
 
-    // Create counter and get handle
-    let counter = Counter { count: 0 };
-    let ud = lua.create_typed_userdata(counter, "Counter").unwrap();
-    lua.set_global("counter", ud).unwrap();
-
-    // Lua increments it twice
-    lua.exec("counter:increment()").unwrap();
-    lua.exec("counter:increment()").unwrap();
-
-    // Rust can read the value using borrow()
-    let value = ud.borrow::<Counter>(lua.state()).unwrap().get();
-    assert_eq!(value, 2);
-
-    // Rust can modify using borrow_mut()
-    ud.borrow_mut::<Counter>(lua.state_mut()).unwrap().add(10);
-
-    // Lua can see Rust's changes
-    lua.exec("result = counter:get()").unwrap();
-    let result: f64 = lua.global("result").unwrap();
-    assert_eq!(result, 12.0);
-
-    // Rust can directly access fields
-    if let Some(c) = ud.borrow::<Counter>(lua.state()) {
-        assert_eq!(c.count, 12);
-    }
-
-    // Rust can modify fields directly
-    if let Some(c) = ud.borrow_mut::<Counter>(lua.state_mut()) {
-        c.count = 100;
-    }
-
-    // Lua sees the direct field change
-    lua.exec("final = counter:get()").unwrap();
-    let final_result: f64 = lua.global("final").unwrap();
-    assert_eq!(final_result, 100.0);
+    lua.exec(
+        r#"
+        local c = Counter.zero()
+        assert(c:value() == 0, "Counter should start at 0")
+    "#,
+    )
+    .unwrap();
 }
 
-// Test that demonstrates the limitations of Approach 1
 #[test]
-fn test_approach1_requires_state() {
+fn test_counter_modify() {
     let mut lua = Lua::new().unwrap();
     Counter::register(lua.state_mut()).unwrap();
 
-    let counter = Counter { count: 5 };
-    let ud = lua.create_typed_userdata(counter, "Counter").unwrap();
-
-    // Cannot access without state - this is the limitation
-    // ud.get() // Would not compile - no such method
-
-    // Must use borrow with state reference
-    let value = ud.borrow::<Counter>(lua.state()).unwrap().count;
-    assert_eq!(value, 5);
-
-    // Multiple borrows are allowed if immutable
-    let v1 = ud.borrow::<Counter>(lua.state()).unwrap().count;
-    let v2 = ud.borrow::<Counter>(lua.state()).unwrap().count;
-    assert_eq!(v1, v2);
+    lua.exec(
+        r#"
+        local c = Counter.new(10)
+        c:modify(42)
+        assert(c:value() == 42, "Counter should be 42 after modify")
+    "#,
+    )
+    .unwrap();
 }
 
-// Test that shows borrow checking at runtime
 #[test]
-fn test_approach1_runtime_checking() {
+fn test_counter_inc() {
     let mut lua = Lua::new().unwrap();
     Counter::register(lua.state_mut()).unwrap();
 
-    let counter = Counter { count: 0 };
-    let ud = lua.create_typed_userdata(counter, "Counter").unwrap();
+    lua.exec(
+        r#"
+        local c = Counter.new(0)
+        c:step()
+        assert(c:value() == 1, "Counter should be 1 after inc")
+        c:step()
+        assert(c:value() == 2, "Counter should be 2 after second inc")
+    "#,
+    )
+    .unwrap();
+}
 
-    // Returns Some when userdata is valid
-    assert!(ud.borrow::<Counter>(lua.state()).is_some());
+#[test]
+fn test_counter_dec() {
+    let mut lua = Lua::new().unwrap();
+    Counter::register(lua.state_mut()).unwrap();
 
-    // Returns None if wrong type requested
-    assert!(ud.borrow::<String>(lua.state()).is_none());
+    lua.exec(
+        r#"
+        local c = Counter.new(5)
+        c:dec()
+        assert(c:value() == 4, "Counter should be 4 after dec")
+    "#,
+    )
+    .unwrap();
+}
 
-    // Can get mutable borrow
-    assert!(ud.borrow_mut::<Counter>(lua.state_mut()).is_some());
+#[test]
+fn test_counter_full_workflow() {
+    let mut lua = Lua::new().unwrap();
+    Counter::register(lua.state_mut()).unwrap();
+
+    lua.exec(
+        r#"
+        -- Test constructor
+        local c1 = Counter.new(10)
+        assert(c1:value() == 10)
+        
+        -- Test zero constructor
+        local c2 = Counter.zero()
+        assert(c2:value() == 0)
+        
+        -- Test modify
+        c1:modify(100)
+        assert(c1:value() == 100)
+        
+        -- Test increment
+        c2:step()
+        c2:step()
+        c2:step()
+        assert(c2:value() == 3)
+        
+        -- Test decrement
+        c1:dec()
+        assert(c1:value() == 99)
+        
+        -- Test multiple operations
+        c2:modify(50)
+        c2:step()
+        c2:dec()
+        assert(c2:value() == 50)
+    "#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_custom_naming() {
+    let mut lua = Lua::new().unwrap();
+    Counter::register(lua.state_mut()).unwrap();
+
+    lua.exec(
+        r#"
+        local c = Counter.zero()
+        assert(c.value ~= nil, "value method should exist")
+        assert(c.get == nil, "get method should not exist (renamed to value)")
+        
+        c:step()
+        assert(c:value() == 1, "step should work (renamed from inc)")
+    "#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_namespaced_constructors() {
+    let mut lua = Lua::new().unwrap();
+    Counter::register(lua.state_mut()).unwrap();
+
+    lua.exec(
+        r#"
+        -- Verify constructors are namespaced under Counter
+        assert(Counter ~= nil, "Counter table should exist")
+        assert(Counter.new ~= nil, "Counter.new should exist")
+        assert(Counter.zero ~= nil, "Counter.zero should exist")
+        
+        -- Verify global namespace is not polluted
+        assert(new == nil, "new should not be global")
+        assert(zero == nil, "zero should not be global")
+        
+        -- Verify constructors work
+        local c1 = Counter.new(42)
+        assert(c1:value() == 42)
+        
+        local c2 = Counter.zero()
+        assert(c2:value() == 0)
+    "#,
+    )
+    .unwrap();
 }

@@ -1,67 +1,58 @@
 //! Procedural macros for automatic Rust-Lua struct bindings.
 //!
-//! This crate provides derive macros that generate the boilerplate code needed
-//! to expose Rust structs to Lua with type-safe method calls.
+//! This crate provides derive macros and attributes that generate boilerplate code
+//! for exposing Rust structs to Lua with type-safe method calls. It follows the KISS
+//! principle to keep the implementation simple and maintainable.
 //!
 //! # Examples
 //!
 //! ```
-//! use rilua::{Lua, LuaApiMut};
-//! use rilua_derive::{LuaUserData, lua_methods};
+//! use rilua_derive::{LuaUserData, lua_register, lua_callable, lua_function};
 //!
 //! #[derive(LuaUserData)]
 //! struct Counter {
 //!     count: i32,
 //! }
 //!
-//! #[lua_methods]
+//! #[lua_register]
 //! impl Counter {
-//!     #[lua(constructor)]
+//!     #[lua_callable]
 //!     fn new(initial: i32) -> Self {
 //!         Self { count: initial }
 //!     }
-//!     
-//!     #[lua]
+//!
+//!     #[lua_callable("value")]
 //!     fn get(&self) -> i32 {
 //!         self.count
 //!     }
-//!     
-//!     #[lua]
-//!     fn increment(&mut self) {
+//!
+//!     #[lua_function]
+//!     fn inc(&mut self, _state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
 //!         self.count += 1;
+//!         Ok(0)
 //!     }
 //! }
-//!
-//! let mut lua = Lua::new().unwrap();
-//! Counter::register(lua.state_mut()).unwrap();
-//!
-//! lua.exec(r#"
-//!     local c = Counter(0)
-//!     c:increment()
-//!     print(c:get())  -- prints: 1
-//! "#).unwrap();
 //! ```
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, FnArg, ImplItem, ItemImpl, ReturnType};
+use syn::{DeriveInput, FnArg, ImplItem, ItemImpl, ReturnType, parse_macro_input};
 
-/// Derives basic userdata support for a struct.
+/// Derives the `LuaUserData` trait for a struct, enabling it to be used with Lua.
 ///
-/// This macro generates helper functions required by `#[lua_methods]`.
-/// Must be used in conjunction with `#[lua_methods]` on the impl block.
+/// This macro generates a `__lua_type_name()` method that returns the struct's name
+/// as a string literal, which is used internally for type identification in Lua.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```
-/// use rilua_derive::LuaUserData;
-///
+/// # use rilua_derive::LuaUserData;
 /// #[derive(LuaUserData)]
 /// struct MyStruct {
 ///     value: i32,
 /// }
 /// ```
-#[proc_macro_derive(LuaUserData, attributes(lua))]
+#[proc_macro_derive(LuaUserData)]
 pub fn derive_lua_userdata(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
@@ -77,255 +68,430 @@ pub fn derive_lua_userdata(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-/// Generates Lua method wrappers and registration code for an impl block.
+/// Marks an impl block for Lua registration code generation.
 ///
-/// This attribute macro processes methods marked with `#[lua]` or `#[lua(constructor)]`
-/// and generates:
-/// - Wrapper functions that handle argument extraction and type conversion
-/// - A `register(state)` function that sets up the metatable and registers methods
+/// This attribute generates a `register()` function that registers all methods marked
+/// with `#[lua_callable]` or `#[lua_function]` with the Lua state. Static methods
+/// become constructors accessible via the type table (e.g., `Counter.new()`), while
+/// instance methods are added to the metatable (e.g., `counter:value()`).
 ///
-/// # Attributes
-///
-/// - `#[lua]` - Exposes a method to Lua
-/// - `#[lua(constructor)]` - Marks a method as a constructor (registered as global function)
-///
-/// # Generated Code
-///
-/// The macro generates a `register()` function that must be called before using
-/// the type in Lua:
-///
-/// ```ignore
-/// Counter::register(lua.state_mut()).unwrap();
-/// ```
-///
-/// # Example
+/// # Examples
 ///
 /// ```
-/// use rilua_derive::{LuaUserData, lua_methods};
-///
-/// #[derive(LuaUserData)]
-/// struct Point {
-///     x: f64,
-///     y: f64,
-/// }
-///
-/// #[lua_methods]
-/// impl Point {
-///     #[lua(constructor)]
-///     fn new(x: f64, y: f64) -> Self {
-///         Self { x, y }
-///     }
-///     
-///     #[lua]
-///     fn distance(&self) -> f64 {
-///         (self.x * self.x + self.y * self.y).sqrt()
-///     }
-///     
-///     #[lua]
-///     fn move_to(&mut self, x: f64, y: f64) {
-///         self.x = x;
-///         self.y = y;
+/// # use rilua_derive::LuaUserData;
+/// # use rilua_derive::lua_register;
+/// # use rilua_derive::lua_callable;
+/// # #[derive(LuaUserData)]
+/// # struct Counter { count: i32}
+/// #[lua_register]
+/// impl Counter {
+///     #[lua_callable]
+///     fn new(initial: i32) -> Self {
+///         Self { count: initial }
 ///     }
 /// }
-/// ```
-///
-/// In Lua:
-///
-/// ```lua
-/// local p = Point(3.0, 4.0)
-/// print(p:distance())  -- 5.0
-/// p:move_to(5.0, 12.0)
-/// print(p:distance())  -- 13.0
 /// ```
 #[proc_macro_attribute]
-pub fn lua_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn lua_register(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
-    let self_ty = input.self_ty.clone();
+    let self_ty = &input.self_ty;
 
-    let mut wrappers = Vec::new();
-    let mut method_registrations = Vec::new();
-    let mut constructor_registration = None;
-    let mut modified_items = input.items.clone();
+    // get type name simple way
+    let type_name = quote!(#self_ty).to_string();
 
-    for (idx, item) in input.items.iter().enumerate() {
+    // find methods with lua attributes
+    let mut constructor_regs = vec![];
+    let mut method_regs = vec![];
+
+    for item in &input.items {
         if let ImplItem::Fn(method) = item {
-            let has_lua_attr = method.attrs.iter().any(|attr| attr.path().is_ident("lua"));
+            let method_name = &method.sig.ident;
 
-            if !has_lua_attr {
+            // check for lua_callable
+            let has_callable = method
+                .attrs
+                .iter()
+                .any(|a| a.path().is_ident("lua_callable"));
+            // check for lua_function
+            let has_function = method
+                .attrs
+                .iter()
+                .any(|a| a.path().is_ident("lua_function"));
+
+            if !has_callable && !has_function {
                 continue;
             }
 
-            if let ImplItem::Fn(ref mut modified_method) = modified_items[idx] {
-                modified_method
-                    .attrs
-                    .retain(|attr| !attr.path().is_ident("lua"));
-            }
+            // get lua name from attribute or use method name
+            let lua_name = get_lua_name(&method.attrs, method_name);
 
-            let method_name = &method.sig.ident;
-            let wrapper_name =
-                syn::Ident::new(&format!("__lua_{}", method_name), method_name.span());
-
-            let is_constructor = method.attrs.iter().any(|attr| {
-                if attr.path().is_ident("lua") {
-                    if let Ok(meta) = attr.parse_args::<syn::Ident>() {
-                        return meta == "constructor";
-                    }
-                }
-                false
-            });
-
-            let is_mut = method
+            // check if static (constructor)
+            let is_static = !method
                 .sig
                 .inputs
                 .iter()
-                .any(|arg| matches!(arg, FnArg::Receiver(r) if r.mutability.is_some()));
+                .any(|arg| matches!(arg, FnArg::Receiver(_)));
 
-            let args: Vec<_> = method
-                .sig
-                .inputs
-                .iter()
-                .filter_map(|arg| {
-                    if let FnArg::Typed(pat_type) = arg {
-                        Some(pat_type.ty.as_ref())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let arg_extracts: Vec<_> = args
-                .iter()
-                .enumerate()
-                .map(|(i, ty)| {
-                    let idx = if is_constructor { i } else { i + 1 };
-                    let arg_name = syn::Ident::new(&format!("arg{}", i), method_name.span());
-                    quote! {
-                        let #arg_name: #ty = {
-                            let val = state.stack_get(state.base + #idx);
-                            <#ty as rilua::conversion::FromLua>::from_lua(val, &*state)?
-                        };
-                    }
-                })
-                .collect();
-
-            let arg_names: Vec<_> = (0..args.len())
-                .map(|i| syn::Ident::new(&format!("arg{}", i), method_name.span()))
-                .collect();
-
-            let has_return = !matches!(method.sig.output, ReturnType::Default);
-
-            let borrow_call = if is_mut {
-                quote! { borrow_mut::<#self_ty> }
+            let wrapper_name = if has_callable {
+                syn::Ident::new(
+                    &format!("__lua_{}", method_name),
+                    proc_macro2::Span::call_site(),
+                )
             } else {
-                quote! { borrow::<#self_ty> }
+                syn::Ident::new(
+                    &format!("__lua_fn_{}", method_name),
+                    proc_macro2::Span::call_site(),
+                )
             };
 
-            let wrapper = if is_constructor {
-                quote! {
-                    fn #wrapper_name(state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
-                        use rilua::api::LuaApiMut;
-                        use rilua::conversion::IntoLua;
-                        #(#arg_extracts)*
-                        let instance = #self_ty::#method_name(#(#arg_names),*);
-                        let ud = state.create_typed_userdata(instance, stringify!(#self_ty))?;
-                        let lua_val = ud.into_lua(state)?;
-                        state.push(lua_val);
-                        Ok(1)
-                    }
-                }
-            } else if has_return {
-                quote! {
-                    fn #wrapper_name(state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
-                        use rilua::conversion::{FromLua, IntoLua};
-                        let val = state.stack_get(state.base);
-                        let ud = <rilua::handles::AnyUserData as FromLua>::from_lua(val, &*state)?;
-                        #(#arg_extracts)*
-                        let result = {
-                            let data = match ud.#borrow_call(state) {
-                                Some(d) => d,
-                                None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
-                                    message: concat!(stringify!(#self_ty), " expected").to_string(),
-                                    level: 0,
-                                    traceback: vec![],
-                                })),
-                            };
-                            data.#method_name(#(#arg_names),*)
-                        };
-                        let lua_val = result.into_lua(state)?;
-                        state.push(lua_val);
-                        Ok(1)
-                    }
-                }
-            } else {
-                quote! {
-                    fn #wrapper_name(state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
-                        use rilua::conversion::{FromLua, IntoLua};
-                        let val = state.stack_get(state.base);
-                        let ud = <rilua::handles::AnyUserData as FromLua>::from_lua(val, &*state)?;
-                        #(#arg_extracts)*
-                        {
-                            let data = match ud.#borrow_call(state) {
-                                Some(d) => d,
-                                None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
-                                    message: concat!(stringify!(#self_ty), " expected").to_string(),
-                                    level: 0,
-                                    traceback: vec![],
-                                })),
-                            };
-                            data.#method_name(#(#arg_names),*);
-                        }
-                        Ok(0)
-                    }
-                }
-            };
-
-            wrappers.push(wrapper);
-
-            if is_constructor {
-                constructor_registration = Some(quote! {
-                    state.register_function(stringify!(#self_ty), Self::#wrapper_name)?;
+            if is_static {
+                constructor_regs.push(quote! {
+                    state.table_set_function(&type_table, #lua_name, Self::#wrapper_name)?;
                 });
             } else {
-                let method_name_str = method_name.to_string();
-                method_registrations.push(quote! {
-                    state.table_set_function(&mt, #method_name_str, Self::#wrapper_name)?;
+                method_regs.push(quote! {
+                    state.table_set_function(&mt, #lua_name, Self::#wrapper_name)?;
                 });
             }
         }
     }
 
-    let register_fn = quote! {
-        pub fn register(state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<()> {
-            use rilua::api::LuaApiMut;
-            use rilua::vm::value::Val;
-
-            let mt = state.create_userdata_metatable(stringify!(#self_ty))?;
-
-            #(#method_registrations)*
-
-            let index_key = state.create_string(b"__index");
-            state.table_raw_set(&mt, index_key, Val::Table(mt.gc_ref()))?;
-
-            #constructor_registration
-
-            Ok(())
-        }
-    };
-
-    let modified_input = ItemImpl {
-        items: modified_items,
-        ..input
-    };
-
     let expanded = quote! {
-        #modified_input
+        #input
 
         impl #self_ty {
-            #(#wrappers)*
+            pub fn register(state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<()> {
+                use rilua::api::LuaApiMut;
+                use rilua::vm::value::Val;
 
-            #register_fn
+                let mt = state.create_userdata_metatable(#type_name)?;
+                let type_table = state.create_table();
+
+                #(#constructor_regs)*
+                #(#method_regs)*
+
+                let index_key = state.create_string(b"__index");
+                state.table_raw_set(&mt, index_key, Val::Table(mt.gc_ref()))?;
+
+                state.set_global(#type_name, Val::Table(type_table.gc_ref()))?;
+
+                Ok(())
+            }
         }
     };
 
     TokenStream::from(expanded)
+}
+
+/// Marks a method for automatic Lua wrapper generation with automatic state handling.
+///
+/// This attribute generates a wrapper function that handles all Lua state management,
+/// including parameter extraction, type conversion, and result pushing. The original
+/// method signature is preserved.
+///
+/// For static methods (no `self` parameter), the wrapper creates a constructor that
+/// returns a new userdata instance. For instance methods, it extracts the userdata
+/// from the Lua stack and calls the method on it.
+///
+/// # Optional Custom Name
+///
+/// You can specify a custom Lua name by passing a string literal:
+/// `#[lua_callable("custom_name")]`
+///
+/// # Examples
+///
+/// ```ignore
+/// 
+/// #[lua_callable]
+/// fn new(initial: i32) -> Self {
+///     Self { count: initial }
+/// }
+///
+/// #[lua_callable("value")]
+/// fn get(&self) -> i32 {
+///     self.count
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn lua_callable(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let method = parse_macro_input!(item as syn::ImplItemFn);
+    let method_name = &method.sig.ident;
+    let wrapper_name = syn::Ident::new(
+        &format!("__lua_{}", method_name),
+        proc_macro2::Span::call_site(),
+    );
+
+    // check if static
+    let is_static = !method
+        .sig
+        .inputs
+        .iter()
+        .any(|arg| matches!(arg, FnArg::Receiver(_)));
+
+    // count params (excluding self)
+    let param_count: usize = method
+        .sig
+        .inputs
+        .iter()
+        .filter(|arg| !matches!(arg, FnArg::Receiver(_)))
+        .count();
+
+    // check if has return
+    let has_return = !matches!(method.sig.output, ReturnType::Default);
+
+    // get param types
+    let param_types: Vec<_> = method
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(pat_type) = arg {
+                Some(&pat_type.ty)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // generate param extraction
+    let param_extracts: Vec<_> = param_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            let idx = if is_static { i } else { i + 1 };
+            let arg_name = syn::Ident::new(&format!("arg{}", i), proc_macro2::Span::call_site());
+            quote! {
+                let #arg_name: #ty = {
+                    let val = state.stack_get(state.base + #idx);
+                    <#ty as rilua::conversion::FromLua>::from_lua(val, &*state)?
+                };
+            }
+        })
+        .collect();
+
+    let arg_names: Vec<_> = (0..param_count)
+        .map(|i| syn::Ident::new(&format!("arg{}", i), proc_macro2::Span::call_site()))
+        .collect();
+
+    let wrapper_body = if is_static {
+        // constructor
+        quote! {
+            let instance = Self::#method_name(#(#arg_names),*);
+            let type_name = Self::__lua_type_name();
+            let ud = state.create_typed_userdata(instance, type_name)?;
+            let lua_val = ud.into_lua(state)?;
+            state.push(lua_val);
+            Ok(1)
+        }
+    } else {
+        // check mutability
+        let is_mut = method.sig.inputs.iter().any(|arg| {
+            if let FnArg::Receiver(r) = arg {
+                r.mutability.is_some()
+            } else {
+                false
+            }
+        });
+
+        if is_mut {
+            if has_return {
+                quote! {
+                    let val = state.stack_get(state.base);
+                    let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
+                    let result = {
+                        let mut data = match ud.borrow_mut::<Self>(state) {
+                            Some(d) => d,
+                            None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                                message: "type mismatch".to_string(),
+                                level: 0,
+                                traceback: vec![],
+                            }))
+                        };
+                        data.#method_name(#(#arg_names),*)
+                    };
+                    let lua_val = result.into_lua(state)?;
+                    state.push(lua_val);
+                    Ok(1)
+                }
+            } else {
+                quote! {
+                    let val = state.stack_get(state.base);
+                    let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
+                    {
+                        let mut data = match ud.borrow_mut::<Self>(state) {
+                            Some(d) => d,
+                            None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                                message: "type mismatch".to_string(),
+                                level: 0,
+                                traceback: vec![],
+                            }))
+                        };
+                        data.#method_name(#(#arg_names),*);
+                    }
+                    Ok(0)
+                }
+            }
+        } else {
+            if has_return {
+                quote! {
+                    let val = state.stack_get(state.base);
+                    let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
+                    let result = {
+                        let data = match ud.borrow::<Self>(state) {
+                            Some(d) => d,
+                            None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                                message: "type mismatch".to_string(),
+                                level: 0,
+                                traceback: vec![],
+                            }))
+                        };
+                        data.#method_name(#(#arg_names),*)
+                    };
+                    let lua_val = result.into_lua(state)?;
+                    state.push(lua_val);
+                    Ok(1)
+                }
+            } else {
+                quote! {
+                    let val = state.stack_get(state.base);
+                    let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
+                    {
+                        let data = match ud.borrow::<Self>(state) {
+                            Some(d) => d,
+                            None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                                message: "type mismatch".to_string(),
+                                level: 0,
+                                traceback: vec![],
+                            }))
+                        };
+                        data.#method_name(#(#arg_names),*);
+                    }
+                    Ok(0)
+                }
+            }
+        }
+    };
+
+    let expanded = quote! {
+        #[allow(non_snake_case)]
+        fn #wrapper_name(state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
+            use rilua::conversion::{FromLua, IntoLua};
+            use rilua::api::LuaApiMut;
+
+            #(#param_extracts)*
+            #wrapper_body
+        }
+
+        #method
+    };
+
+    TokenStream::from(expanded)
+}
+
+/// Marks a method for Lua registration where you handle the Lua state manually.
+///
+/// Unlike `#[lua_callable]`, this attribute does not generate automatic parameter
+/// extraction or result handling. The method must have the signature:
+/// - `fn(&self, &mut LuaState) -> LuaResult<u32>` for immutable methods
+/// - `fn(&mut self, &mut LuaState) -> LuaResult<u32>` for mutable methods
+///
+/// This is useful when you need fine-grained control over Lua stack operations
+/// or want to implement custom behavior that doesn't fit the automatic wrapper pattern.
+///
+/// # Optional Custom Name
+///
+/// You can specify a custom Lua name by passing a string literal:
+/// `#[lua_function("custom_name")]`
+///
+/// # Examples
+///
+/// ```ignore
+/// #[lua_function("step")]
+/// fn inc(&mut self, state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
+///     self.count += 1;
+///     Ok(0)
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn lua_function(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let method = parse_macro_input!(item as syn::ImplItemFn);
+    let method_name = &method.sig.ident;
+    let wrapper_name = syn::Ident::new(
+        &format!("__lua_fn_{}", method_name),
+        proc_macro2::Span::call_site(),
+    );
+
+    // check mutability
+    let is_mut = method.sig.inputs.iter().any(|arg| {
+        if let FnArg::Receiver(r) = arg {
+            r.mutability.is_some()
+        } else {
+            false
+        }
+    });
+
+    let wrapper_body = if is_mut {
+        quote! {
+            let val = state.stack_get(state.base);
+            let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
+            let data_ptr = {
+                let data = match ud.borrow_mut::<Self>(state) {
+                    Some(d) => d,
+                    None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                        message: "type mismatch".to_string(),
+                        level: 0,
+                        traceback: vec![],
+                    }))
+                };
+                data as *mut Self
+            };
+            unsafe { (*data_ptr).#method_name(state) }
+        }
+    } else {
+        quote! {
+            let val = state.stack_get(state.base);
+            let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
+            let data_ptr = {
+                let data = match ud.borrow::<Self>(state) {
+                    Some(d) => d,
+                    None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                        message: "type mismatch".to_string(),
+                        level: 0,
+                        traceback: vec![],
+                    }))
+                };
+                data as *const Self
+            };
+            unsafe { (*data_ptr).#method_name(state) }
+        }
+    };
+
+    let expanded = quote! {
+        #[allow(non_snake_case)]
+        fn #wrapper_name(state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
+            use rilua::conversion::FromLua;
+
+            #wrapper_body
+        }
+
+        #method
+    };
+
+    TokenStream::from(expanded)
+}
+
+/// Extracts the Lua name from method attributes.
+///
+/// Checks for `#[lua_callable("name")]` or `#[lua_function("name")]` attributes
+/// and returns the custom name if present, otherwise returns the method's identifier.
+fn get_lua_name(attrs: &[syn::Attribute], default: &syn::Ident) -> String {
+    for attr in attrs {
+        if (attr.path().is_ident("lua_callable") || attr.path().is_ident("lua_function"))
+            && let Ok(meta_list) = attr.meta.require_list()
+            && let Ok(lit) = syn::parse2::<syn::LitStr>(meta_list.tokens.clone())
+        {
+            return lit.value();
+        }
+    }
+    default.to_string()
 }

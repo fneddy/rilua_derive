@@ -23,7 +23,6 @@ dependencies = [
 [[package]]
 name = "rilua"
 version = "0.1.20"
-source = "git+https://github.com/fneddy/rilua.git?branch=lua_api#e38a6641a56dac651acf71e097057ca5793dd98f"
 
 [[package]]
 name = "rilua_derive"

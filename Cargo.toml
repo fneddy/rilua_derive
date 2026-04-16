@@ -2,20 +2,14 @@
 name = "rilua_derive"
 version = "0.1.0"
 edition = "2024"
-authors = ["rilua contributors"]
-description = "Procedural macros for automatic Rust-Lua struct bindings in rilua"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/wowemulation-dev/rilua"
-keywords = ["lua", "derive", "macro", "scripting"]
-categories = ["api-bindings", "game-development"]
 
 [lib]
 proc-macro = true
 
 [dependencies]
-syn = { version = "2.0", features = ["full", "extra-traits"] }
-quote = "1.0"
 proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
 
 [dev-dependencies]
-rilua = { git = "https://github.com/fneddy/rilua.git", branch = "lua_api" }
+rilua = { path = "../rilua" }
