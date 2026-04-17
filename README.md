@@ -1,4 +1,4 @@
-# rilua_derive3
+# rilua_derive
 
 Procedural macros for automatic Rust-Lua struct bindings with minimal complexity.
 
@@ -9,7 +9,7 @@ This crate provides derive macros and attributes that generate boilerplate code 
 ## Usage
 
 ```rust
-use rilua_derive3::{LuaUserData, lua_callable, lua_function, lua_register};
+use rilua_derive::{LuaUserData, lua_callable, lua_function, lua_register};
 
 #[derive(LuaUserData)]
 struct Counter {
