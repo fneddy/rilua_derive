@@ -1,88 +1,157 @@
 # rilua_derive
 
-Procedural macros for automatic Rust-Lua struct bindings with minimal complexity.
+Procedural macros for automatic Rust-Lua bindings. Simple and practical.
 
-## Overview
+## Features
 
-This crate provides derive macros and attributes that generate boilerplate code for exposing Rust structs to Lua with type-safe method calls.
+Two approaches for Rust-Lua integration:
 
-## Usage
+1. **Userdata** - Rust objects with methods callable from Lua
+2. **Table conversion** - Serialize Rust structs to/from Lua tables
+
+## Userdata (Objects with Methods)
+
+### Minimal Example
 
 ```rust
-use rilua_derive::{LuaUserData, lua_callable, lua_function, lua_register};
+use rilua::{Lua, LuaApiMut};
+use rilua_derive::{LuaUserData, lua_register, lua_callable};
 
-#[derive(LuaUserData)]
-struct Counter {
-    count: i32,
-}
+#[derive(LuaUserData, Clone)]
+struct Counter { count: i32 }
 
 #[lua_register]
 impl Counter {
-    // Constructor - static method
     #[lua_callable]
-    fn new(initial: i32) -> Self {
-        Self { count: initial }
-    }
+    fn new(val: i32) -> Self { Self { count: val } }
 
-    // Constructor with custom Lua name
-    #[lua_callable("zero")]
-    fn default() -> Self {
-        Self { count: 0 }
-    }
-
-    // Mutable method
     #[lua_callable]
-    fn modify(&mut self, new_value: i32) {
-        self.count = new_value;
-    }
+    fn get(&self) -> i32 { self.count }
 
-    // Immutable method with custom name
-    #[lua_callable("value")]
-    fn get(&self) -> i32 {
-        self.count
-    }
-
-    // Raw Lua function - manual state handling
-    #[lua_function("step")]
-    fn inc(&mut self, _state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
-        self.count += 1;
-        Ok(0)
-    }
+    #[lua_callable]
+    fn increment(&mut self) { self.count += 1; }
 }
 
-// Register with Lua
 let mut lua = Lua::new().unwrap();
 Counter::register(lua.state_mut()).unwrap();
-
-// Use in Lua
-lua.exec(r#"
-    local c = Counter.new(5)
-    print(c:value())  -- 5
-    c:modify(10)
-    print(c:value())  -- 10
-    c:step()
-    print(c:value())  -- 11
-"#).unwrap();
+lua.exec("c = Counter.new(5); c:increment(); print(c:get())").unwrap();
 ```
 
-## Attributes
+### Custom Lua Names
 
-### `#[derive(LuaUserData)]`
-Enables a struct to be used with Lua. Required on the struct definition.
+```rust
+#[lua_callable("value")]
+fn get(&self) -> i32 { self.count }
+```
 
-### `#[lua_register]`
-Generates a `register()` function for the impl block. Call this to register the type with Lua.
+Lua: `c:value()` instead of `c:get()`
 
-### `#[lua_callable]` or `#[lua_callable("custom_name")]`
-Generates a wrapper function for the method, handling all Lua state management automatically.
-- Static methods become constructors (e.g., `Counter.new()`)
-- Instance methods become methods (e.g., `c:value()`)
-- Optional custom Lua name can be specified
+### Manual State Control
 
-### `#[lua_function]` or `#[lua_function("custom_name")]`
-Marks a method for registration where you handle the Lua state manually.
-Method signature must be: `fn(&self, &mut LuaState) -> LuaResult<u32>` or `fn(&mut self, &mut LuaState) -> LuaResult<u32>`
+```rust
+use rilua_derive::lua_function;
+use rilua::vm::state::LuaState;
 
-## Design Philosophy
+#[lua_function]
+fn raw(&mut self, state: &mut LuaState) -> rilua::error::LuaResult<u32> {
+    // manual stack manipulation
+    Ok(0)
+}
+```
 
-This crate follows the KISS principle: Keep It Simple, Stupid. By avoiding unnecessary abstractions and keeping the code direct and straightforward, it's easier to understand, maintain, and debug while providing the same functionality as more complex implementations.
+### Static Functions
+
+```rust
+#[lua_function]
+fn helper(state: &mut LuaState) -> rilua::error::LuaResult<u32> {
+    // no self - static function
+    Ok(0)
+}
+```
+
+Lua: `Counter.helper()`
+
+## Table Conversion (Plain Data)
+
+### Minimal Example
+
+```rust
+use rilua::{Lua, LuaApi, LuaApiMut};
+use rilua::conversion::{IntoLua, FromLua};
+use rilua_derive::{IntoLua, FromLua};
+
+#[derive(IntoLua, FromLua)]
+struct Position { x: f64, y: f64 }
+
+let mut lua = Lua::new().unwrap();
+
+// Rust to Lua table
+let pos = Position { x: 1.0, y: 2.0 };
+let val = pos.into_lua(lua.state_mut()).unwrap();
+lua.set_global("pos", val).unwrap();
+
+// Lua to Rust
+lua.exec("pos2 = { x = 3.0, y = 4.0 }").unwrap();
+let val = lua.global("pos2").unwrap();
+let pos2 = Position::from_lua(val, lua.state()).unwrap();
+```
+
+### Nested Structs
+
+```rust
+#[derive(IntoLua, FromLua)]
+struct Entity {
+    name: String,
+    pos: Position,  // nested
+}
+```
+
+### Optional Fields
+
+```rust
+#[derive(IntoLua, FromLua)]
+struct Config {
+    width: u32,
+    debug: Option<bool>,  // nil in Lua if None
+}
+```
+
+### Custom Field Names
+
+```rust
+#[derive(IntoLua, FromLua)]
+struct Player {
+    #[lua(rename = "maxHP")]
+    max_health: i32,
+}
+```
+
+Lua: `player.maxHP` instead of `player.max_health`
+
+## Userdata vs Tables
+
+**Cannot mix both on same struct!** Pick one:
+
+```rust
+// Option 1: Userdata (object with methods)
+#[derive(LuaUserData, Clone)]
+struct Player { health: i32 }
+
+// Option 2: Table (plain data)
+#[derive(IntoLua, FromLua)]
+struct SaveData { level: u32 }
+
+// ❌ WRONG - conflict!
+// #[derive(LuaUserData, IntoLua, FromLua)]
+```
+
+## All Macros
+
+| Macro | Purpose |
+|-------|---------|
+| `#[derive(LuaUserData)]` | Enable struct as userdata (requires `Clone`) |
+| `#[lua_register]` | Generate `register()` function for impl block |
+| `#[lua_callable]` | Auto-wrap method with Lua state handling |
+| `#[lua_function]` | Register method with manual state control |
+| `#[derive(IntoLua)]` | Convert struct to Lua table |
+| `#[derive(FromLua)]` | Convert Lua table to struct |
