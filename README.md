@@ -4,7 +4,7 @@ Procedural macros for automatic Rust-Lua struct bindings with minimal complexity
 
 ## Overview
 
-This crate provides derive macros and attributes that generate boilerplate code for exposing Rust structs to Lua with type-safe method calls. It's a simplified reimplementation of `rilua_derive2` with reduced complexity and improved maintainability.
+This crate provides derive macros and attributes that generate boilerplate code for exposing Rust structs to Lua with type-safe method calls.
 
 ## Usage
 

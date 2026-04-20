@@ -9,7 +9,7 @@
 //! ```
 //! use rilua_derive::{LuaUserData, lua_register, lua_callable, lua_function};
 //!
-//! #[derive(LuaUserData)]
+//! #[derive(LuaUserData, Clone)]
 //! struct Counter {
 //!     count: i32,
 //! }
@@ -40,14 +40,18 @@ use syn::{DeriveInput, FnArg, ImplItem, ItemImpl, ReturnType, parse_macro_input}
 
 /// Derives the `LuaUserData` trait for a struct, enabling it to be used with Lua.
 ///
-/// This macro generates a `__lua_type_name()` method that returns the struct's name
-/// as a string literal, which is used internally for type identification in Lua.
+/// This macro generates:
+/// - A `__lua_type_name()` method that returns the struct's name as a string literal
+/// - An `IntoLua` implementation that creates userdata
+/// - A `FromLua` implementation that extracts userdata
+///
+/// The struct must implement `Clone` to support extraction from userdata.
 ///
 /// # Examples
 ///
 /// ```
 /// # use rilua_derive::LuaUserData;
-/// #[derive(LuaUserData)]
+/// #[derive(LuaUserData, Clone)]
 /// struct MyStruct {
 ///     value: i32,
 /// }
@@ -56,11 +60,54 @@ use syn::{DeriveInput, FnArg, ImplItem, ItemImpl, ReturnType, parse_macro_input}
 pub fn derive_lua_userdata(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
+    let generics = &input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let expanded = quote! {
-        impl #name {
+        impl #impl_generics #name #ty_generics #where_clause {
             pub fn __lua_type_name() -> &'static str {
                 stringify!(#name)
+            }
+        }
+
+        impl #impl_generics rilua::conversion::IntoLua for #name #ty_generics
+        #where_clause
+        {
+            fn into_lua<L: rilua::api::LuaApiMut>(self, lua: &mut L) -> rilua::error::LuaResult<rilua::vm::value::Val> {
+                let type_name = Self::__lua_type_name();
+                let ud = lua.create_typed_userdata(self, type_name)?;
+                Ok(rilua::vm::value::Val::Userdata(ud.gc_ref()))
+            }
+        }
+
+        impl #impl_generics rilua::conversion::FromLua for #name #ty_generics
+        where
+            Self: Clone,
+            #where_clause
+        {
+            fn from_lua<L: rilua::api::LuaApi>(val: rilua::vm::value::Val, lua: &L) -> rilua::error::LuaResult<Self> {
+                use rilua::conversion::FromLua;
+
+                match val {
+                    rilua::vm::value::Val::Userdata(_) => {
+                        let ud = rilua::handles::AnyUserData::from_lua(val, lua)?;
+                        let state: &rilua::vm::state::LuaState = lua.state();
+                        ud.borrow::<Self>(state)
+                            .ok_or_else(|| {
+                                rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                                    message: format!("{} userdata expected, got wrong userdata type", Self::__lua_type_name()),
+                                    level: 0,
+                                    traceback: vec![],
+                                })
+                            })
+                            .map(|data| data.clone())
+                    }
+                    _ => Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                        message: format!("{} userdata expected, got {}", Self::__lua_type_name(), val.type_name()),
+                        level: 0,
+                        traceback: vec![],
+                    }))
+                }
             }
         }
     };
@@ -81,7 +128,7 @@ pub fn derive_lua_userdata(input: TokenStream) -> TokenStream {
 /// # use rilua_derive::LuaUserData;
 /// # use rilua_derive::lua_register;
 /// # use rilua_derive::lua_callable;
-/// # #[derive(LuaUserData)]
+/// # #[derive(LuaUserData, Clone)]
 /// # struct Counter { count: i32}
 /// #[lua_register]
 /// impl Counter {
@@ -201,7 +248,7 @@ pub fn lua_register(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Examples
 ///
 /// ```ignore
-/// 
+///
 /// #[lua_callable]
 /// fn new(initial: i32) -> Self {
 ///     Self { count: initial }
@@ -392,6 +439,7 @@ pub fn lua_callable(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Unlike `#[lua_callable]`, this attribute does not generate automatic parameter
 /// extraction or result handling. The method must have the signature:
+/// - `fn(state: &mut LuaState) -> LuaResult<u32>` for static methods
 /// - `fn(&self, &mut LuaState) -> LuaResult<u32>` for immutable methods
 /// - `fn(&mut self, &mut LuaState) -> LuaResult<u32>` for mutable methods
 ///
@@ -411,6 +459,12 @@ pub fn lua_callable(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     self.count += 1;
 ///     Ok(0)
 /// }
+///
+/// #[lua_function]
+/// fn helper(state: &mut rilua::vm::state::LuaState) -> rilua::error::LuaResult<u32> {
+///     // static function - no self
+///     Ok(0)
+/// }
 /// ```
 #[proc_macro_attribute]
 pub fn lua_function(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -421,48 +475,62 @@ pub fn lua_function(_attr: TokenStream, item: TokenStream) -> TokenStream {
         proc_macro2::Span::call_site(),
     );
 
-    // check mutability
-    let is_mut = method.sig.inputs.iter().any(|arg| {
-        if let FnArg::Receiver(r) = arg {
-            r.mutability.is_some()
-        } else {
-            false
-        }
-    });
+    // check if static (no self)
+    let has_self = method
+        .sig
+        .inputs
+        .iter()
+        .any(|arg| matches!(arg, FnArg::Receiver(_)));
 
-    let wrapper_body = if is_mut {
+    let wrapper_body = if !has_self {
+        // static function - just call directly
         quote! {
-            let val = state.stack_get(state.base);
-            let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
-            let data_ptr = {
-                let data = match ud.borrow_mut::<Self>(state) {
-                    Some(d) => d,
-                    None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
-                        message: "type mismatch".to_string(),
-                        level: 0,
-                        traceback: vec![],
-                    }))
-                };
-                data as *mut Self
-            };
-            unsafe { (*data_ptr).#method_name(state) }
+            Self::#method_name(state)
         }
     } else {
-        quote! {
-            let val = state.stack_get(state.base);
-            let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
-            let data_ptr = {
-                let data = match ud.borrow::<Self>(state) {
-                    Some(d) => d,
-                    None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
-                        message: "type mismatch".to_string(),
-                        level: 0,
-                        traceback: vec![],
-                    }))
+        // instance method - check mutability
+        let is_mut = method.sig.inputs.iter().any(|arg| {
+            if let FnArg::Receiver(r) = arg {
+                r.mutability.is_some()
+            } else {
+                false
+            }
+        });
+
+        if is_mut {
+            quote! {
+                let val = state.stack_get(state.base);
+                let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
+                let data_ptr = {
+                    let data = match ud.borrow_mut::<Self>(state) {
+                        Some(d) => d,
+                        None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                            message: "type mismatch".to_string(),
+                            level: 0,
+                            traceback: vec![],
+                        }))
+                    };
+                    data as *mut Self
                 };
-                data as *const Self
-            };
-            unsafe { (*data_ptr).#method_name(state) }
+                unsafe { (*data_ptr).#method_name(state) }
+            }
+        } else {
+            quote! {
+                let val = state.stack_get(state.base);
+                let ud = <rilua::handles::AnyUserData as rilua::conversion::FromLua>::from_lua(val, &*state)?;
+                let data_ptr = {
+                    let data = match ud.borrow::<Self>(state) {
+                        Some(d) => d,
+                        None => return Err(rilua::error::LuaError::Runtime(rilua::error::RuntimeError {
+                            message: "type mismatch".to_string(),
+                            level: 0,
+                            traceback: vec![],
+                        }))
+                    };
+                    data as *const Self
+                };
+                unsafe { (*data_ptr).#method_name(state) }
+            }
         }
     };
 
