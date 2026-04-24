@@ -1,5 +1,5 @@
 use rilua::{Lua, LuaApi, LuaApiMut};
-use rilua_derive::{LuaUserData, lua_callable, lua_function, lua_register};
+use rilua_derive::{lua_callable, lua_function, lua_register, LuaUserData};
 
 #[derive(LuaUserData, Clone)]
 struct Counter {
@@ -26,6 +26,11 @@ impl Counter {
     #[lua_callable("value")]
     fn get(&self) -> i32 {
         self.count
+    }
+
+    #[lua_callable]
+    fn set_value(&mut self, new_value: i32) {
+        self.count = new_value;
     }
 
     #[lua_function("step")]
@@ -117,4 +122,48 @@ fn test_userdata_conversion() {
     let result_val = counter.into_lua(lua.state_mut()).unwrap();
     lua.set_global("c2", result_val).unwrap();
     lua.exec("assert(c2:value() == 42)").unwrap();
+}
+
+#[test]
+fn test_convention_based_setters() {
+    let mut lua = Lua::new().unwrap();
+    Counter::register(lua.state_mut()).unwrap();
+
+    lua.exec(
+        r#"
+        local c = Counter.new(10)
+        
+        -- getter works
+        assert(c:value() == 10, "initial value")
+        
+        -- explicit setter method works
+        c:modify(25)
+        assert(c:value() == 25, "value after modify")
+        
+        -- test property-style getter (should work via __index)
+        local value_via_property = c.value
+        print("value via property: " .. tostring(value_via_property))
+        print("value via property type: " .. type(value_via_property))
+        
+        -- property getter should return the method function, not call it
+        assert(type(value_via_property) == "function", "property access returns function")
+        
+        -- property-style assignment should error with helpful message
+        local ok, err = pcall(function()
+            c.value = 100
+        end)
+        assert(not ok, "property set should error")
+        assert(string.find(err, "value%(%)"), "error should mention value() getter")
+        assert(string.find(err, "set_value%(%)"), "error should mention set_value() setter")
+        print("Error message: " .. err)
+        
+        -- verify explicit setter methods work
+        c:modify(50)
+        assert(c:value() == 50, "set via method works")
+        
+        -- verify setter is registered as method
+        assert(c.modify ~= nil, "modify method exists")
+    "#,
+    )
+    .unwrap();
 }

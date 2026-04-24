@@ -124,12 +124,99 @@ pub fn derive_lua_userdata(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+fn generate_newindex_error_handler() -> proc_macro2::TokenStream {
+    quote! {
+        let newindex_closure = rilua::vm::closure::Closure::Rust(
+            rilua::vm::closure::RustClosure::new(
+                |state: &mut rilua::vm::state::LuaState| -> rilua::error::LuaResult<u32> {
+                    use rilua::conversion::FromLua;
+                    
+                    let key_val = state.stack_get(state.base + 1);
+                    let key = String::from_lua(key_val, state).unwrap_or_else(|_| "<unknown>".to_string());
+                    
+                    Err(rilua::error::RuntimeError::new(
+                        format!("Cannot use property syntax. Use getter :{}() and setter :set_{}() methods instead", key, key)
+                    ).into())
+                },
+                "__newindex_error"
+            )
+        );
+        let newindex_ref = state.gc.alloc_closure(newindex_closure);
+        
+        let newindex_key = state.create_string(b"__newindex");
+        state.table_raw_set(&mt, newindex_key, rilua::vm::value::Val::Function(newindex_ref))?;
+    }
+}
+
+struct MethodRegistrations {
+    constructors: Vec<proc_macro2::TokenStream>,
+    methods: Vec<proc_macro2::TokenStream>,
+    setters: Vec<proc_macro2::TokenStream>,
+}
+
+fn process_impl_methods(input: &ItemImpl) -> MethodRegistrations {
+    let mut constructor_regs = vec![];
+    let mut method_regs = vec![];
+    let mut setter_regs = vec![];
+
+    for item in &input.items {
+        if let ImplItem::Fn(method) = item {
+            let method_name = &method.sig.ident;
+
+            let has_callable = method.attrs.iter().any(|a| a.path().is_ident("lua_callable"));
+            let has_function = method.attrs.iter().any(|a| a.path().is_ident("lua_function"));
+
+            if !has_callable && !has_function {
+                continue;
+            }
+
+            let lua_name = get_lua_name(&method.attrs, method_name);
+            let is_static = is_method_static(method);
+            let wrapper_name = if has_callable {
+                syn::Ident::new(&format!("__lua_{}", method_name), proc_macro2::Span::call_site())
+            } else {
+                syn::Ident::new(&format!("__lua_fn_{}", method_name), proc_macro2::Span::call_site())
+            };
+
+            let method_name_str = method_name.to_string();
+            let is_setter = method_name_str.starts_with("set_") && has_callable && !is_static;
+
+            if is_static {
+                constructor_regs.push(quote! {
+                    state.table_set_function(&type_table, #lua_name, Self::#wrapper_name)?;
+                });
+            } else if is_setter {
+                let property_name = &method_name_str[4..];
+                setter_regs.push(quote! {
+                    state.table_set_function(&newindex_table, #property_name, Self::#wrapper_name)?;
+                });
+                method_regs.push(quote! {
+                    state.table_set_function(&index_table, #lua_name, Self::#wrapper_name)?;
+                });
+            } else {
+                method_regs.push(quote! {
+                    state.table_set_function(&index_table, #lua_name, Self::#wrapper_name)?;
+                });
+            }
+        }
+    }
+
+    MethodRegistrations {
+        constructors: constructor_regs,
+        methods: method_regs,
+        setters: setter_regs,
+    }
+}
+
 /// Marks an impl block for Lua registration code generation.
 ///
 /// This attribute generates a `register()` function that registers all methods marked
 /// with `#[lua_callable]` or `#[lua_function]` with the Lua state. Static methods
 /// become constructors accessible via the type table (e.g., `Counter.new()`), while
 /// instance methods are added to the metatable (e.g., `counter:value()`).
+///
+/// Methods starting with `set_*` are detected as setters and will trigger helpful
+/// error messages if property-style assignment is attempted.
 ///
 /// # Examples
 ///
@@ -151,62 +238,18 @@ pub fn derive_lua_userdata(input: TokenStream) -> TokenStream {
 pub fn lua_register(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
     let self_ty = &input.self_ty;
-
-    // get type name simple way
     let type_name = quote!(#self_ty).to_string();
 
-    // find methods with lua attributes
-    let mut constructor_regs = vec![];
-    let mut method_regs = vec![];
+    let regs = process_impl_methods(&input);
 
-    for item in &input.items {
-        if let ImplItem::Fn(method) = item {
-            let method_name = &method.sig.ident;
+    let newindex_setup = if regs.setters.is_empty() {
+        quote! {}
+    } else {
+        generate_newindex_error_handler()
+    };
 
-            // check for lua_callable
-            let has_callable = method
-                .attrs
-                .iter()
-                .any(|a| a.path().is_ident("lua_callable"));
-            // check for lua_function
-            let has_function = method
-                .attrs
-                .iter()
-                .any(|a| a.path().is_ident("lua_function"));
-
-            if !has_callable && !has_function {
-                continue;
-            }
-
-            // get lua name from attribute or use method name
-            let lua_name = get_lua_name(&method.attrs, method_name);
-
-            // check if static (constructor)
-            let is_static = is_method_static(method);
-
-            let wrapper_name = if has_callable {
-                syn::Ident::new(
-                    &format!("__lua_{}", method_name),
-                    proc_macro2::Span::call_site(),
-                )
-            } else {
-                syn::Ident::new(
-                    &format!("__lua_fn_{}", method_name),
-                    proc_macro2::Span::call_site(),
-                )
-            };
-
-            if is_static {
-                constructor_regs.push(quote! {
-                    state.table_set_function(&type_table, #lua_name, Self::#wrapper_name)?;
-                });
-            } else {
-                method_regs.push(quote! {
-                    state.table_set_function(&mt, #lua_name, Self::#wrapper_name)?;
-                });
-            }
-        }
-    }
+    let constructor_regs = &regs.constructors;
+    let method_regs = &regs.methods;
 
     let expanded = quote! {
         #input
@@ -220,10 +263,14 @@ pub fn lua_register(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let type_table = state.create_table();
 
                 #(#constructor_regs)*
+                
+                let index_table = state.create_table();
                 #(#method_regs)*
 
                 let index_key = state.create_string(b"__index");
-                state.table_raw_set(&mt, index_key, Val::Table(mt.gc_ref()))?;
+                state.table_raw_set(&mt, index_key, Val::Table(index_table.gc_ref()))?;
+
+                #newindex_setup
 
                 state.set_global(#type_name, Val::Table(type_table.gc_ref()))?;
 
